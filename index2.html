@@ -1,155 +1,251 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>DuckDB-WASM Parquet Explorer</title>
-  <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:20px}
-    .controls{display:flex;gap:8px;align-items:center;margin-bottom:12px}
-    textarea{width:100%;height:100px;font-family:monospace}
-    table{border-collapse:collapse;width:100%;margin-top:8px}
-    th,td{border:1px solid #ddd;padding:6px;text-align:left}
-    .small{font-size:13px;color:#555}
-  </style>
-</head>
-<body>
-  <h1>DuckDB-WASM parquet uploader</h1>
-  <div class="controls">
-    <input id="parquet" type="file" accept=".parquet" />
-    <button id="loadBtn" disabled>Load into DuckDB</button>
-    <select id="sampleLimit"><option value="25">25</option><option value="100">100</option><option value="500">500</option></select>
-    <button id="previewBtn" disabled>Preview</button>
-  </div>
-  <div class="small">Library served from jsDelivr CDN. Works fully in-browser (no server).</div>
-
-  <label>SQL (you may use <code>read_parquet('uploaded.parquet')</code>):</label>
-  <textarea id="sql">SELECT * FROM read_parquet('uploaded.parquet') LIMIT 25;</textarea>
-  <div style="display:flex;gap:8px;margin-top:8px">
-    <button id="runBtn" disabled>Run SQL</button>
-    <button id="downloadCsv" disabled>Download CSV</button>
-    <div id="status" class="small"></div>
-  </div>
-
-  <div id="results"></div>
-
-  <script type="module">
-    // Minimal, modular helpers
-    const $ = id => document.getElementById(id);
-    const setStatus = txt => { $('status').textContent = txt; };
-
-    let duckdb; // module
-    let db;     // AsyncDuckDB instance
-    let conn;   // connection
-    let registeredFilename = null;
-
-    async function initDuckDB() {
-      setStatus('Loading duckdb-wasm from CDN...');
-      // import ESM build from jsDelivr (uses duckdb's selectBundle internally)
-      const duck = await import('https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.30.0/+esm');
-      const JSDELIVR_BUNDLES = duck.getJsDelivrBundles();
-      const bundle = await duck.selectBundle(JSDELIVR_BUNDLES);
-
-      // create a Worker from the worker URL recommended by the bundle
-      const worker_url = URL.createObjectURL(
-        new Blob([`importScripts("${bundle.mainWorker}");`], { type: 'text/javascript' })
-      );
-
-      const worker = new Worker(worker_url);
-      const logger = new duck.ConsoleLogger();
-      const asyncDB = new duck.AsyncDuckDB(logger, worker);
-
-      await asyncDB.instantiate(bundle.mainModule, bundle.pthreadWorker);
-      duckdb = duck;
-      db = asyncDB;
-      conn = await db.connect();
-      setStatus('DuckDB ready');
-      $('loadBtn').disabled = false;
-    }
-
-    async function registerFile(file) {
-      setStatus(`Registering ${file.name}...`);
-      const buf = await file.arrayBuffer();
-      const u8 = new Uint8Array(buf);
-      const name = 'uploaded.parquet';
-      // register file in duckdb's virtual FS
-      await db.registerFileBuffer(name, u8);
-      registeredFilename = name;
-      setStatus(`Registered as ${name}`);
-      $('previewBtn').disabled = false;
-      $('runBtn').disabled = false;
-      $('downloadCsv').disabled = false;
-    }
-
-    function renderTable(rows) {
-      if (!rows || rows.length === 0) return $('results').innerHTML = '<div class="small">No rows</div>';
-      const cols = Object.keys(rows[0]);
-      const thead = `<tr>${cols.map(c=>`<th>${c}</th>`).join('')}</tr>`;
-      const body = rows.map(r => `<tr>${cols.map(c=>`<td>${String(r[c] ?? '')}</td>`).join('')}</tr>`).join('');
-      $('results').innerHTML = `<table><thead>${thead}</thead><tbody>${body}</tbody></table>`;
-    }
-
-    async function runSQL() {
-      const sql = $('sql').value;
-      setStatus('Running query...');
-      try {
-        const res = await conn.query(sql);
-        // conn.query returns an object with toArray? use arrow conversion
-        // duckdb returns {columns, data} for query
-        if (res && res.toArray) {
-          const arr = await res.toArray();
-          renderTable(arr);
-        } else if (Array.isArray(res)) {
-          renderTable(res);
-        } else if (res && res.columns && res.data) {
-          // transform
-          const rows = res.data.map(r => Object.fromEntries(res.columns.map((c,i)=>[c.name, r[i]])));
-          renderTable(rows);
-        } else {
-          $('results').innerText = JSON.stringify(res, null, 2);
-        }
-        setStatus('Query finished');
-      } catch (err) {
-        setStatus('Error: ' + err.message);
-        $('results').innerText = err.stack || err.message;
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Parquet viewer powered by DuckDB</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+        margin: 20px;
       }
-    }
+      .controls {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        margin-bottom: 12px;
+      }
+      textarea {
+        width: 100%;
+        height: 100px;
+        font-family: monospace;
+      }
+      table {
+        border-collapse: collapse;
 
-    async function preview() {
-      const limit = Number($('sampleLimit').value);
-      $('sql').value = `SELECT * FROM read_parquet('${registeredFilename}') LIMIT ${limit};`;
-      await runSQL();
-    }
+        margin-top: 8px;
+        table-layout: fixed;
+      }
+      th,
+      td {
+        border: 1px solid #ddd;
+        padding: 6px;
+        text-align: left;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 300px;
+        white-space: nowrap;
+      }
+      .small {
+        font-size: 13px;
+        color: #555;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Parquet viewer powered by DuckDB</h1>
+    <div class="controls">
+      <input id="parquet" type="file" accept=".parquet" />
+      <button id="loadBtn" disabled>Load into DuckDB</button>
+      <select id="sampleLimit">
+        <option value="25">25</option>
+        <option value="100">100</option>
+        <option value="500">500</option>
+      </select>
+      <button id="previewBtn" disabled>Preview</button>
+    </div>
+    <div class="small">
+      Library served from jsDelivr CDN. Works fully in-browser (no server).
+    </div>
 
-    function downloadCSV() {
-      const table = $('results').querySelector('table');
-      if (!table) return;
-      const rows = Array.from(table.querySelectorAll('tr')).map(tr =>
-        Array.from(tr.querySelectorAll('th,td')).map(td => '"' + td.textContent.replace(/"/g,'""') + '"').join(',')
-      );
-      const csv = rows.join('\n');
-      const blob = new Blob([csv], {type:'text/csv'});
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url; a.download = 'duckdb_export.csv'; a.click();
-      URL.revokeObjectURL(url);
-    }
+    <label
+      >SQL (you may use <code>read_parquet('uploaded.parquet')</code>):</label
+    >
+    <textarea id="sql">
+SELECT * FROM read_parquet('uploaded.parquet')</textarea
+    >
+    <div style="display: flex; gap: 8px; margin-top: 8px">
+      <button id="runBtn" disabled>Run SQL</button>
+      <button id="downloadCsv" disabled>CSV</button>
+      <button id="downloadXlsx" disabled>Excel</button>
+      <div id="status" class="small"></div>
+    </div>
 
-    // Wire UI
-    $('parquet').addEventListener('change', e => {
-      const f = e.target.files && e.target.files[0];
-      if (f) registerFile(f);
-    });
-    $('loadBtn').addEventListener('click', () => {
-      const f = $('parquet').files && $('parquet').files[0];
-      if (f) registerFile(f);
-    });
-    $('previewBtn').addEventListener('click', preview);
-    $('runBtn').addEventListener('click', runSQL);
-    $('downloadCsv').addEventListener('click', downloadCSV);
+    <div id="results"></div>
 
-    // Init right away
-    initDuckDB().catch(e=>{ setStatus('Failed to init: '+e.message); console.error(e); });
-  </script>
-</body>
+    <script type="module">
+      const $ = (id) => document.getElementById(id);
+      const setStatus = (txt) => {
+        $("status").textContent = txt;
+      };
+
+      let db, conn;
+
+      async function initDuckDB() {
+        setStatus("Loading duckdb-wasm from CDN...");
+        const duck = await import(
+          "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.31.0/+esm"
+        );
+        const bundles = duck.getJsDelivrBundles();
+        const bundle = await duck.selectBundle(bundles);
+
+        const worker_url = URL.createObjectURL(
+          new Blob([`importScripts("${bundle.mainWorker}");`], {
+            type: "text/javascript",
+          })
+        );
+        const worker = new Worker(worker_url);
+        const logger = new duck.ConsoleLogger();
+        const asyncDB = new duck.AsyncDuckDB(logger, worker);
+
+        await asyncDB.instantiate(bundle.mainModule, bundle.pthreadWorker);
+        db = asyncDB;
+        conn = await db.connect();
+        setStatus("DuckDB ready");
+        $("loadBtn").disabled = false;
+      }
+
+      async function registerFile(file) {
+        setStatus(`Registering ${file.name}...`);
+        const buf = await file.arrayBuffer();
+        const u8 = new Uint8Array(buf);
+        const name = "uploaded.parquet";
+        await db.registerFileBuffer(name, u8);
+        setStatus(`Registered as ${name}`);
+        $("previewBtn").disabled = false;
+        $("runBtn").disabled = false;
+        $("downloadCsv").disabled = false;
+        $("downloadXlsx").disabled = false;
+      }
+
+      function renderTable(rows) {
+        if (!rows || rows.length === 0)
+          return ($("results").innerHTML = '<div class="small">No rows</div>');
+        const cols = Object.keys(rows[0]);
+        const thead = `<tr>${cols.map((c) => `<th>${c}</th>`).join("")}</tr>`;
+        const body = rows
+          .map(
+            (r) =>
+              `<tr>${cols
+                .map(
+                  (c) =>
+                    `<td title="${String(r[c] ?? "")}">${String(
+                      r[c] ?? ""
+                    ).slice(0, 300)}</td>`
+                )
+                .join("")}</tr>`
+          )
+          .join("");
+        $(
+          "results"
+        ).innerHTML = `<table><thead>${thead}</thead><tbody>${body}</tbody></table>`;
+      }
+
+      async function runSQL() {
+        let sql = $("sql").value;
+
+        // Add LIMIT if not already present
+        let addedLimit = false
+        const limit = 1000;
+        if (!/limit\s+\d+/i.test(sql)) {
+          sql += ` LIMIT ${limit}`;
+          addedLimit = true
+        }
+
+        setStatus("Running query...");
+        try {
+          const start = performance.now();
+          const res = await conn.query(sql);
+          const arr = await res.toArray();
+          const end = performance.now();
+
+          // shape
+          const rows = arr.length;
+          const cols = arr[0] ? Object.keys(arr[0]).length : 0;
+
+          renderTable(arr);
+          setStatus(
+            `Query finished in ${(end - start).toFixed(
+              1
+            )} ms. Shape: ${rows} rows × ${cols} columns. ${addedLimit ? 'added limit of '+limit+'to keep ui performant' : ""}`
+          );
+        } catch (err) {
+          setStatus("Error: " + err.message);
+          $("results").innerText = err.stack || err.message;
+        }
+      }
+
+      async function preview() {
+        const limit = Number($("sampleLimit").value);
+        $(
+          "sql"
+        ).value = `SELECT * FROM read_parquet('uploaded.parquet') LIMIT ${limit};`;
+        await runSQL();
+      }
+
+      async function exportCsv(sql) {
+        // pick an output name in DuckDB’s virtual FS
+        const outName = "export.csv";
+        // run COPY command
+        await conn.query(
+          `COPY (${sql}) TO '${outName}' (FORMAT CSV, HEADER TRUE)`
+        );
+
+        // read the file back from the VFS
+        const buffer = await db.copyFileToBuffer(outName);
+        const blob = new Blob([buffer], { type: "text/csv" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = outName;
+        a.click();
+        URL.revokeObjectURL(url);
+      }
+
+      async function downloadCSV() {
+        await exportCsv($("sql").value);
+      }
+
+      async function downloadXlsx() {
+        const sql = $("sql").value;
+        const outName = "export.xlsx";
+        await conn.query(
+          `INSTALL excel; LOAD excel;COPY (${sql}) TO '${outName}' (FORMAT XLSX, HEADER TRUE)`
+        );
+        const buffer = await db.copyFileToBuffer(outName);
+
+        // If the first byte is 0x40, strip it
+        const firstByte = buffer[0];
+        const correctedBuffer = buffer.slice(1);
+
+        const blob = new Blob([correctedBuffer], {
+          type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = outName;
+        a.click();
+        URL.revokeObjectURL(url);
+      }
+
+      $("parquet").addEventListener("change", (e) => {
+        const f = e.target.files && e.target.files[0];
+        if (f) registerFile(f);
+      });
+      $("loadBtn").addEventListener("click", () => {
+        const f = $("parquet").files && $("parquet").files[0];
+        if (f) registerFile(f);
+      });
+      $("previewBtn").addEventListener("click", preview);
+      $("runBtn").addEventListener("click", runSQL);
+      $("downloadCsv").addEventListener("click", downloadCSV);
+      $("downloadXlsx").addEventListener("click", downloadXlsx);
+
+      initDuckDB().catch((e) => {
+        setStatus("Failed to init: " + e.message);
+        console.error(e);
+      });
+    </script>
+  </body>
 </html>
